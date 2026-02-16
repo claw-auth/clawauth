@@ -1,0 +1,30 @@
+{
+  "name": "clawauth",
+  "version": "0.4.1",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "clawauth": "scripts/cli.js"
+  },
+  "files": [
+    "scripts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cli": "node scripts/cli.js",
+    "prepublishOnly": "node --check scripts/cli.js && node --check src/worker.js"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "keytar": "^7.9.0",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.32.0"
+  }
+}

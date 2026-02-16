@@ -1,0 +1,21 @@
+name = "clawauth"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[vars]
+PUBLIC_BASE_URL = "https://auth.clawauth.app"
+SESSION_TTL_SECONDS = "3600"
+
+[[routes]]
+pattern = "auth.clawauth.app"
+custom_domain = true
+
+[[kv_namespaces]]
+binding = "KV"
+id = "d813214ca68c408eba07300f7288da90"
+preview_id = "76aa3ece9cbc49d59b1e4a37c7051209"
