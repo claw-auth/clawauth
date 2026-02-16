@@ -124,7 +124,7 @@ function safeString(value, maxLength = 120) {
 }
 
 function trackEvent(env, request, event, details = {}) {
-  const analytics = env.ANALYTICS;
+  const analytics = env.AUTH_ENDPOINT || env.ANALYTICS;
   if (!analytics || typeof analytics.writeDataPoint !== 'function') {
     return;
   }
