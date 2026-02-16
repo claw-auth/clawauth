@@ -19,3 +19,7 @@ custom_domain = true
 binding = "KV"
 id = "d813214ca68c408eba07300f7288da90"
 preview_id = "76aa3ece9cbc49d59b1e4a37c7051209"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "clawauth_events"

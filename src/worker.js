@@ -119,6 +119,50 @@ const PROVIDERS = {
 
 const PROVIDER_NAMES = Object.keys(PROVIDERS);
 
+function safeString(value, maxLength = 120) {
+  return String(value ?? '').slice(0, maxLength);
+}
+
+function trackEvent(env, request, event, details = {}) {
+  const analytics = env.ANALYTICS;
+  if (!analytics || typeof analytics.writeDataPoint !== 'function') {
+    return;
+  }
+
+  let pathname = '';
+  try {
+    pathname = new URL(request.url).pathname;
+  } catch {
+    pathname = '';
+  }
+
+  try {
+    analytics.writeDataPoint({
+      indexes: [
+        safeString(event, 64),
+        safeString(details.provider || details.requestedProvider || 'unknown', 80),
+        safeString(details.result || 'unknown', 40)
+      ],
+      doubles: [
+        Date.now(),
+        Number(details.httpStatus || 0),
+        Number(details.expiresIn || 0)
+      ],
+      blobs: [
+        safeString(details.requestedProvider || '', 120),
+        safeString(details.errorCode || '', 120),
+        safeString(request.method, 12),
+        safeString(pathname, 200),
+        safeString(request?.cf?.country || '', 8),
+        safeString(request?.cf?.colo || '', 16),
+        safeString(request.headers.get('user-agent') || '', 240)
+      ]
+    });
+  } catch (error) {
+    console.warn(`analytics write failed: ${error?.message || 'unknown_error'}`);
+  }
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -469,27 +513,27 @@ function verifySignedRequest(session, sessionId, request, pathname) {
   const requestNonce = request.headers.get('x-request-nonce') || '';
 
   if (!validateFreshTimestamp(timestamp)) {
-    return { ok: false, response: unauthorized('Invalid or stale timestamp') };
+    return { ok: false, code: 'invalid_timestamp', response: unauthorized('Invalid or stale timestamp') };
   }
   if (!validateNonce(requestNonce)) {
-    return { ok: false, response: unauthorized('Invalid request nonce') };
+    return { ok: false, code: 'invalid_nonce', response: unauthorized('Invalid request nonce') };
   }
 
   const nowMs = Date.now();
   if (session.lastPollAt && nowMs - session.lastPollAt < MIN_POLL_INTERVAL_MS) {
-    return { ok: false, response: tooManyRequests('Polling too fast') };
+    return { ok: false, code: 'polling_too_fast', response: tooManyRequests('Polling too fast') };
   }
   if ((session.pollCount || 0) >= MAX_POLL_COUNT) {
-    return { ok: false, response: tooManyRequests('Polling limit reached') };
+    return { ok: false, code: 'polling_limit_reached', response: tooManyRequests('Polling limit reached') };
   }
   if ((session.usedNonces || []).includes(requestNonce)) {
-    return { ok: false, response: unauthorized('Replay detected') };
+    return { ok: false, code: 'replay_detected', response: unauthorized('Replay detected') };
   }
 
   const sigBytes = tryDecodeBase64(signatureB64);
   const verifyBytes = tryDecodeBase64(session.verifyKey || '');
   if (!sigBytes || sigBytes.length !== nacl.sign.signatureLength || !verifyBytes) {
-    return { ok: false, response: unauthorized() };
+    return { ok: false, code: 'invalid_signature_format', response: unauthorized() };
   }
 
   const canonical = `${timestamp}|${sessionId}|GET|${pathname}|${requestNonce}`;
@@ -499,7 +543,7 @@ function verifySignedRequest(session, sessionId, request, pathname) {
     verifyBytes
   );
   if (!valid) {
-    return { ok: false, response: unauthorized() };
+    return { ok: false, code: 'signature_verification_failed', response: unauthorized() };
   }
 
   const usedNonces = [...(session.usedNonces || []), requestNonce].slice(-NONCE_CACHE_SIZE);
@@ -520,10 +564,19 @@ export default {
     const origin = env.PUBLIC_BASE_URL || defaultOrigin;
 
     if (!env.STATE_SIGNING_SECRET) {
+      trackEvent(env, request, 'worker_config_error', {
+        result: 'error',
+        httpStatus: 500,
+        errorCode: 'missing_state_signing_secret'
+      });
       return json({ error: 'Worker misconfigured: missing STATE_SIGNING_SECRET' }, 500);
     }
 
     if (url.pathname === '/providers' && request.method === 'GET') {
+      trackEvent(env, request, 'providers_list', {
+        result: 'ok',
+        httpStatus: 200
+      });
       return json({ providers: PROVIDER_NAMES });
     }
 
@@ -533,26 +586,60 @@ export default {
       const sessionId = pathParts[1];
       const raw = await env.KV.get(sessionId);
       if (!raw) {
+        trackEvent(env, request, 'shortlink_redirect', {
+          provider,
+          result: 'error',
+          httpStatus: 404,
+          errorCode: 'session_not_found'
+        });
         return messagePage('Session Expired', 'This authentication session was not found or has expired.', 404);
       }
 
       const session = JSON.parse(raw);
       if (session.provider !== provider) {
+        trackEvent(env, request, 'shortlink_redirect', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'provider_session_mismatch'
+        });
         return messagePage('Session Error', 'Provider and session do not match.', 400);
       }
 
       if (session.status === 'completed') {
+        trackEvent(env, request, 'shortlink_redirect', {
+          provider,
+          result: 'already_completed',
+          httpStatus: 410
+        });
         return messagePage('Already Completed', 'This authentication session is already complete.', 410);
       }
 
       if (session.status === 'error') {
+        trackEvent(env, request, 'shortlink_redirect', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: safeString(session.error || 'session_error', 120)
+        });
         return messagePage('Session Error', `Session failed: ${session.error || 'unknown error'}`, 400);
       }
 
       if (!session.authUrl) {
+        trackEvent(env, request, 'shortlink_redirect', {
+          provider,
+          result: 'error',
+          httpStatus: 500,
+          errorCode: 'missing_auth_url'
+        });
         return messagePage('Server Error', 'Missing auth URL for this session.', 500);
       }
 
+      trackEvent(env, request, 'shortlink_redirect', {
+        provider,
+        result: 'ok',
+        httpStatus: 302
+      });
       return Response.redirect(session.authUrl, 302);
     }
 
@@ -561,15 +648,32 @@ export default {
       try {
         body = await request.json();
       } catch {
+        trackEvent(env, request, 'init_session', {
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'invalid_json'
+        });
         return badRequest('Invalid JSON');
       }
 
       const { verifyKey, boxPublicKey, provider: providerInput, scope, ttlSeconds } = body ?? {};
       const provider = pickProvider(providerInput);
       if (!provider) {
+        trackEvent(env, request, 'init_session', {
+          requestedProvider: safeString(providerInput, 80),
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'invalid_provider'
+        });
         return badRequest('Missing or invalid provider. Pass provider explicitly.');
       }
       if (!PROVIDERS[provider]) {
+        trackEvent(env, request, 'init_session', {
+          requestedProvider: provider,
+          result: 'not_implemented',
+          httpStatus: 501,
+          errorCode: 'provider_not_implemented'
+        });
         return notImplemented({
           status: 'not_implemented',
           featureRequestReceived: true,
@@ -582,6 +686,13 @@ export default {
       const config = loadProviderConfig(provider, env, origin);
       const misconfig = ensureProviderSecrets(config);
       if (misconfig) {
+        trackEvent(env, request, 'init_session', {
+          provider,
+          requestedProvider: providerInput,
+          result: 'error',
+          httpStatus: 500,
+          errorCode: 'provider_misconfigured'
+        });
         return json({ error: misconfig }, 500);
       }
 
@@ -589,9 +700,21 @@ export default {
       const boxBytes = tryDecodeBase64(boxPublicKey || '');
 
       if (!verifyBytes || verifyBytes.length !== nacl.sign.publicKeyLength) {
+        trackEvent(env, request, 'init_session', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'invalid_verify_key'
+        });
         return badRequest('verifyKey must be base64 Ed25519 public key');
       }
       if (!boxBytes || boxBytes.length !== nacl.box.publicKeyLength) {
+        trackEvent(env, request, 'init_session', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'invalid_box_public_key'
+        });
         return badRequest('boxPublicKey must be base64 Curve25519 public key');
       }
 
@@ -618,6 +741,13 @@ export default {
       );
 
       const shortAuthUrl = `${origin}/${provider}/${sessionId}`;
+      trackEvent(env, request, 'init_session', {
+        provider,
+        requestedProvider: providerInput,
+        result: 'ok',
+        httpStatus: 200,
+        expiresIn: sessionTtlSeconds
+      });
       return json({
         sessionId,
         provider,
@@ -635,22 +765,44 @@ export default {
       const oauthErrorDescription = url.searchParams.get('error_description');
 
       if (!state) {
+        trackEvent(env, request, 'oauth_callback', {
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'missing_state'
+        });
         return badRequest('Missing state');
       }
 
       const stateData = await parseAndVerifyState(state, env.STATE_SIGNING_SECRET);
       if (!stateData) {
+        trackEvent(env, request, 'oauth_callback', {
+          result: 'error',
+          httpStatus: 401,
+          errorCode: 'invalid_state'
+        });
         return unauthorized('Invalid state');
       }
 
       const { sessionId, provider } = stateData;
       const raw = await env.KV.get(sessionId);
       if (!raw) {
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'error',
+          httpStatus: 404,
+          errorCode: 'session_not_found'
+        });
         return notFound('Session not found or expired');
       }
 
       const session = JSON.parse(raw);
       if (session.provider !== provider) {
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'error',
+          httpStatus: 401,
+          errorCode: 'state_provider_mismatch'
+        });
         return unauthorized('State/provider mismatch');
       }
 
@@ -665,14 +817,31 @@ export default {
           }),
           { expirationTtl: sessionTtl(session, env) }
         );
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: safeString(`oauth_error:${oauthError}`, 120)
+        });
         return messagePage('Authentication Failed', `${provider} returned: ${oauthError}.`, 400);
       }
 
       if (!code) {
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'error',
+          httpStatus: 400,
+          errorCode: 'missing_code'
+        });
         return badRequest('Missing code');
       }
 
       if (session.status === 'completed') {
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'already_completed',
+          httpStatus: 200
+        });
         return messagePage('Already Completed', 'This authentication session has already been completed.', 200);
       }
 
@@ -696,6 +865,11 @@ export default {
           { expirationTtl: sessionTtl(session, env) }
         );
 
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'ok',
+          httpStatus: 200
+        });
         return messagePage(
           'Authentication Complete',
           `Your ${provider} account is connected. You can close this tab now.`,
@@ -713,6 +887,12 @@ export default {
           { expirationTtl: sessionTtl(session, env) }
         );
 
+        trackEvent(env, request, 'oauth_callback', {
+          provider,
+          result: 'error',
+          httpStatus: 500,
+          errorCode: safeString(error?.message || 'callback_error', 120)
+        });
         return messagePage('Authentication Error', `Callback failed: ${error.message}`, 500);
       }
     }
@@ -731,20 +911,42 @@ export default {
       const session = JSON.parse(raw);
       const checked = verifySignedRequest(session, sessionId, request, `/status/${sessionId}`);
       if (!checked.ok) {
+        trackEvent(env, request, 'status_poll', {
+          provider: session.provider,
+          result: 'error',
+          httpStatus: checked.response.status,
+          errorCode: checked.code || 'verification_failed'
+        });
         return checked.response;
       }
 
       const nextSession = checked.nextSession;
       if (session.status === 'error') {
         await env.KV.put(sessionId, JSON.stringify(nextSession), { expirationTtl: sessionTtl(session, env) });
+        trackEvent(env, request, 'status_poll', {
+          provider: session.provider,
+          result: 'session_error',
+          httpStatus: 400,
+          errorCode: safeString(session.error || 'callback_failed', 120)
+        });
         return json({ status: 'error', provider: session.provider, error: session.error || 'callback_failed' }, 400);
       }
 
       if (session.status === 'completed') {
+        trackEvent(env, request, 'status_poll', {
+          provider: session.provider,
+          result: 'completed',
+          httpStatus: 200
+        });
         return json({ status: 'completed', provider: session.provider });
       }
 
       await env.KV.put(sessionId, JSON.stringify(nextSession), { expirationTtl: sessionTtl(session, env) });
+      trackEvent(env, request, 'status_poll', {
+        provider: session.provider,
+        result: 'pending',
+        httpStatus: 200
+      });
       return json({ status: 'pending', provider: session.provider });
     }
 
@@ -762,23 +964,49 @@ export default {
       const session = JSON.parse(raw);
       const checked = verifySignedRequest(session, sessionId, request, `/claim/${sessionId}`);
       if (!checked.ok) {
+        trackEvent(env, request, 'claim_token', {
+          provider: session.provider,
+          result: 'error',
+          httpStatus: checked.response.status,
+          errorCode: checked.code || 'verification_failed'
+        });
         return checked.response;
       }
 
       if (session.status === 'error') {
         await env.KV.delete(sessionId);
+        trackEvent(env, request, 'claim_token', {
+          provider: session.provider,
+          result: 'session_error',
+          httpStatus: 400,
+          errorCode: safeString(session.error || 'callback_failed', 120)
+        });
         return json({ status: 'error', provider: session.provider, error: session.error || 'callback_failed' }, 400);
       }
 
       if (session.status !== 'completed') {
         await env.KV.put(sessionId, JSON.stringify(checked.nextSession), { expirationTtl: sessionTtl(session, env) });
+        trackEvent(env, request, 'claim_token', {
+          provider: session.provider,
+          result: 'pending',
+          httpStatus: 200
+        });
         return json({ status: 'pending', provider: session.provider });
       }
 
       await env.KV.delete(sessionId);
+      trackEvent(env, request, 'claim_token', {
+        provider: session.provider,
+        result: 'ok',
+        httpStatus: 200
+      });
       return json({ status: 'completed', provider: session.provider, blob: session.blob });
     }
 
+    trackEvent(env, request, 'not_found', {
+      result: 'error',
+      httpStatus: 404
+    });
     return json({ error: 'Not found' }, 404);
   }
 };
